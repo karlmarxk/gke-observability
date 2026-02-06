@@ -1,259 +1,169 @@
-## **Category 1: Critical Actionable Alerts - Your Primary Response Targets**
+## **Consolidated Alert 1: Critical Controllers and Operators Unavailable**
 
-These are alerts for components you directly manage and maintain. When these fire, your team owns the investigation and remediation. These should page your on-call engineer because they represent failures in systems under your operational control.
+This single alert replaces your individual alerts for Gatekeeper, ArgoCD Application Controller, External Secrets, and Vault Agent Injector. The magic happens through label-based filtering in the PromQL query.
 
-### **Alert 1: Gatekeeper Policy Enforcement Unavailable**
+**How This Consolidation Works**
 
-**Description**  
-This alert fires when your Gatekeeper admission controller becomes unavailable, meaning the webhook endpoints are not responding to admission requests from the API server.
+Instead of writing four separate alert rules that each watch one deployment, you write one alert rule that watches all critical deployments using a regular expression to match their names. When any of these deployments goes to zero available replicas, the alert fires with labels identifying which specific deployment failed. Your alerting system treats each deployment as a separate alert instance, so you still get granular visibility into which component is down, but you maintain only one alert definition.
 
-**Rationale**  
-Let me explain why this is your most critical user-managed alert. In a banking environment, Gatekeeper serves as your automated compliance gatekeeper. When developers or automated systems try to create resources in your cluster, Gatekeeper intercepts those requests and validates them against your organizational policies before they ever get persisted to etcd. These policies might enforce things like mandatory resource limits, prohibited capabilities, required security contexts, or mandatory labels for cost allocation. When Gatekeeper is down, you face a critical decision point that's actually configured in the webhook's failure policy. If your webhook is configured with a failure policy of "Ignore," then policy violations can slip through silently, creating compliance debt and potential security vulnerabilities. If it's configured with "Fail," then all resource creation matching the webhook's scope gets blocked, which could halt all deployments across your cluster. Neither outcome is acceptable in production.
-
-**Possible Impact**  
-The impact depends on your webhook configuration, but both scenarios are severe. With a fail-open policy, you might allow privileged containers to run when your security standards prohibit them, or permit containers without resource limits that could monopolize node resources. In regulated banking, these violations could surface during audits and require expensive remediation. With a fail-closed policy, your entire deployment pipeline grinds to a halt. ArgoCD cannot sync applications, your developers cannot deploy their services, and you cannot even deploy a fix to Gatekeeper itself through normal channels. You would need to manually disable the webhook configuration to regain cluster functionality.
-
-**Potential Thresholds and Rationale**  
-I recommend alerting when Gatekeeper controller manager pods are unavailable for more than two minutes. This threshold accounts for brief disruptions during rolling updates while catching genuine failures quickly. The controller manager is the component that actually processes validation requests, so its unavailability directly translates to policy enforcement failure. You should also monitor the audit controller separately because it provides continuous validation of existing resources, helping you detect drift where resources that were compliant at creation time have been mutated into non-compliant states.
+The practical benefit becomes clear during incident response. Your on-call engineer receives an alert that says "Deployment gatekeeper-controller-manager in namespace gatekeeper-system has zero available replicas" and they know immediately that this is a controller unavailability issue. They don't need different runbooks for different controllers because the troubleshooting steps are the same. Check the pod status with kubectl describe, review the logs, verify certificates if it's a webhook, check resource constraints, and examine recent changes.
 
 **PromQL Query**
 ```promql
-# Alert when Gatekeeper controller is completely unavailable
-kube_deployment_status_replicas_available{deployment="gatekeeper-controller-manager",namespace="gatekeeper-system"} == 0
+# Single query that monitors all critical user-managed controllers
+# Fires separate alert instances for each affected deployment
+kube_deployment_status_replicas_available{
+  deployment=~"gatekeeper-controller-manager|gatekeeper-audit|argocd-application-controller|argocd-repo-server|external-secrets.*|vault-agent-injector.*|alertmanager.*",
+  namespace!="kube-system"
+} == 0
 ```
+
+Let me explain what's happening in this query. The kube_deployment_status_replicas_available metric comes from kube-state-metrics and tracks how many replicas of each deployment are currently available and passing readiness checks. The regular expression in the deployment filter matches all your critical controllers and operators. The namespace filter excludes kube-system because those are GCP-managed components that belong in your informational alerts category. When this query evaluates to true (equals zero), it means that specific deployment has no healthy replicas running.
 
 **Alert Definition**
 ```yaml
 groups:
-  - name: user_managed_security
+  - name: critical_platform_controllers
     interval: 30s
     rules:
-      - alert: GatekeeperControllerUnavailable
-        expr: kube_deployment_status_replicas_available{deployment="gatekeeper-controller-manager",namespace="gatekeeper-system"} == 0
+      - alert: CriticalControllerUnavailable
+        expr: |
+          kube_deployment_status_replicas_available{
+            deployment=~"gatekeeper-controller-manager|gatekeeper-audit|argocd-application-controller|argocd-repo-server|external-secrets.*|vault-agent-injector.*|alertmanager.*",
+            namespace!="kube-system"
+          } == 0
         for: 2m
         labels:
           severity: critical
-          component: security
+          component: platform_controller
           managed_by: user
         annotations:
-          summary: "Gatekeeper policy enforcement is completely unavailable"
-          description: "All Gatekeeper controller manager pods are unavailable. Admission webhook cannot enforce policies. Check if failurePolicy=Ignore (allowing violations) or failurePolicy=Fail (blocking all requests)."
-          runbook_url: "https://your-runbook-url/gatekeeper-unavailable"
-          action_required: "Check pod status, review recent changes to Gatekeeper configuration, verify webhook certificates are valid, ensure sufficient cluster resources"
+          summary: "Critical controller {{ $labels.deployment }} is completely unavailable"
+          description: |
+            Deployment {{ $labels.deployment }} in namespace {{ $labels.namespace }} has zero available replicas.
+            
+            Component-specific impact:
+            - gatekeeper-controller: Policy enforcement stopped, admission control may fail
+            - argocd-application-controller: GitOps synchronization halted, no drift detection
+            - argocd-repo-server: Git operations failing, preventing syncs
+            - external-secrets: Secret synchronization stopped, pod restarts will fail
+            - vault-agent-injector: Secret injection webhook unavailable, new pods cannot start
+            - alertmanager: Alert notifications not being sent
+            
+            Current status: {{ $value }} replicas available
+          runbook_url: "https://your-runbook-url/controller-unavailable"
+          action_required: "kubectl get pods -n {{ $labels.namespace }} | grep {{ $labels.deployment }}, kubectl describe pod -n {{ $labels.namespace }}, check logs for crash loops, verify resource limits, check webhook certificates for admission controllers"
 ```
+
+Notice how the annotations template uses the label values to provide context-specific information. The double curly braces are Prometheus template syntax that gets replaced with actual values when the alert fires. So if Gatekeeper fails, you see "gatekeeper-controller-manager" in the summary. If External Secrets fails, you see the external-secrets deployment name. You get specific actionable information from a single consolidated alert rule.
 
 ---
 
-### **Alert 2: ArgoCD Application Controller Unavailable**
+## **Consolidated Alert 2: Critical DaemonSets Not Fully Deployed**
 
-**Description**  
-This alert triggers when your ArgoCD application controller becomes unavailable, preventing GitOps synchronization and breaking your declarative deployment model.
+You already had this one consolidated in the original design, so let me just refine it slightly to make the consolidation pattern more explicit and add some components you might have missed.
 
-**Rationale**  
-Your ArgoCD application controller is the reconciliation engine that continuously compares the desired state in your Git repositories against the actual state in your cluster. Think of it as the conductor of your infrastructure orchestra, constantly ensuring every component plays the right notes. When this controller goes down, you lose the ability to deploy new applications or update existing ones through your GitOps workflow. More subtly, you also lose drift detection, which means someone could make manual changes to your cluster using kubectl and you would not get automatic correction back to the Git-defined state. In a mature GitOps practice, the application controller is your source of truth enforcement, and its failure means your cluster state can diverge from your approved configurations without detection or remediation.
+**Why DaemonSets Deserve Their Own Consolidated Alert**
 
-**Possible Impact**  
-The immediate impact is that deployments stop flowing through your pipeline. If you have a critical security patch that needs to be deployed, it will not sync to your cluster even if you merge the pull request and update your Git repository. Your deployment velocity drops to zero for GitOps-managed applications. The more insidious impact is drift accumulation. During the controller outage, well-meaning engineers might make emergency changes directly with kubectl to resolve incidents. Without the controller running, these changes persist and create configuration inconsistencies between your environments. When the controller finally recovers, it may attempt to revert these emergency changes, potentially causing new incidents if those changes were actually necessary fixes.
+DaemonSets have a fundamentally different failure pattern than deployments. With a deployment, you care whether any replicas are available. With a DaemonSet, you care whether it's running on all the nodes it should be running on. A DaemonSet with ninety-nine percent coverage still represents a blind spot on that one node. This is especially critical for security and observability components where complete coverage is a compliance requirement, not just a best practice.
 
-**Potential Thresholds and Rationale**  
-I suggest alerting when the application controller has been unavailable for more than three minutes. ArgoCD deployments can take a moment to restart during upgrades, and you do not want alert fatigue from planned maintenance. However, three minutes is long enough to distinguish between a rolling update and a genuine failure. The application controller is stateless and should recover quickly if it is simply restarting. If it stays down beyond three minutes, something more serious is happening such as resource exhaustion, persistent crash loops, or infrastructure problems.
+The troubleshooting approach for DaemonSet issues also differs from deployment issues. When a DaemonSet pod is missing from a node, you investigate node-level concerns like taints, resource pressure, and node selectors rather than deployment-level concerns like replica counts and pod disruption budgets.
 
 **PromQL Query**
 ```promql
-# Alert when ArgoCD application controller has no available replicas
-kube_deployment_status_replicas_available{deployment="argocd-application-controller",namespace=~"argocd|argo-cd"} == 0
-```
-
-**Alert Definition**
-```yaml
-groups:
-  - name: user_managed_gitops
-    interval: 30s
-    rules:
-      - alert: ArgoCDApplicationControllerUnavailable
-        expr: kube_deployment_status_replicas_available{deployment="argocd-application-controller",namespace=~"argocd|argo-cd"} == 0
-        for: 3m
-        labels:
-          severity: critical
-          component: gitops
-          managed_by: user
-        annotations:
-          summary: "ArgoCD application controller is unavailable"
-          description: "ArgoCD cannot sync applications or detect configuration drift. GitOps deployments are blocked until controller recovers."
-          runbook_url: "https://your-runbook-url/argocd-controller-unavailable"
-          action_required: "Check controller pod logs, verify Redis connectivity, check for OOMKills, review recent ArgoCD configuration changes, ensure cluster has sufficient CPU and memory"
-```
-
----
-
-### **Alert 3: External Secrets Operator Unavailable**
-
-**Description**  
-This alert fires when your External Secrets operator becomes unavailable, preventing synchronization of secrets from external secret stores into Kubernetes secrets.
-
-**Rationale**  
-The External Secrets operator bridges the gap between your enterprise secret management system such as HashiCorp Vault, AWS Secrets Manager, or Google Secret Manager and your Kubernetes workloads. When this operator is running normally, it continuously syncs secrets from your external store into Kubernetes secret objects that your pods can consume. When it fails, the synchronization stops. Now, here is the critical nuance you need to understand. Existing secrets that were already synced into Kubernetes will continue to exist and your running pods can still access them. The problem emerges when pods restart or when you deploy new applications. Those pods expect the External Secrets operator to have created the necessary Kubernetes secrets, and if the operator is down, those secrets do not exist. The pods will fail to start because they cannot mount the required secret volumes or inject the required environment variables.
-
-**Possible Impact**  
-The impact unfolds gradually rather than immediately. Your currently running workloads continue operating normally because they already have their secrets mounted. However, any pod that restarts will fail to come back up if it depends on secrets managed by the External Secrets operator. This creates a dangerous situation during an incident. Imagine you have a memory leak in a service and the pod gets OOMKilled. Normally, Kubernetes would restart it automatically and you would have momentary downtime. With External Secrets down, that pod cannot restart and your momentary downtime becomes an extended outage. Similarly, any new deployments or scaling operations will fail. In your banking environment, this could prevent you from scaling up to handle increased transaction volume or from deploying urgent fixes.
-
-**Potential Thresholds and Rationale**  
-Alert when the External Secrets operator has zero available replicas for more than two minutes. This component is critical enough that even brief unavailability deserves attention, but two minutes allows for normal rolling updates without creating noise. The operator is typically lightweight and should restart quickly, so extended downtime suggests a real problem such as API authentication failures to your secret backend, network policy issues blocking access to the external secret store, or resource constraints preventing the operator from running.
-
-**PromQL Query**
-```promql
-# Alert when External Secrets operator has no available replicas
-kube_deployment_status_replicas_available{deployment=~"external-secrets.*",namespace=~"external-secrets.*"} == 0
-```
-
-**Alert Definition**
-```yaml
-groups:
-  - name: user_managed_secrets
-    interval: 30s
-    rules:
-      - alert: ExternalSecretsOperatorUnavailable
-        expr: kube_deployment_status_replicas_available{deployment=~"external-secrets.*",namespace=~"external-secrets.*"} == 0
-        for: 2m
-        labels:
-          severity: critical
-          component: secrets
-          managed_by: user
-        annotations:
-          summary: "External Secrets operator is unavailable"
-          description: "Secret synchronization from external stores has stopped. Existing secrets remain available but pod restarts and new deployments will fail if they depend on operator-managed secrets."
-          runbook_url: "https://your-runbook-url/external-secrets-unavailable"
-          action_required: "Verify operator pod status, check authentication to secret backend, review network policies, validate SecretStore configurations, check operator logs for API errors"
-```
-
----
-
-### **Alert 4: Vault Agent Injector Unavailable**
-
-**Description**  
-This alert detects when your Vault Agent Injector mutating webhook becomes unavailable, preventing automatic injection of Vault secrets into pods.
-
-**Rationale**  
-The Vault Agent Injector works through a mutating admission webhook that intercepts pod creation requests. When a pod has specific annotations requesting Vault secret injection, the webhook modifies the pod specification to add init containers and sidecar containers that handle the actual secret retrieval from Vault. This is a different pattern from the External Secrets operator. With External Secrets, the operator creates Kubernetes secret objects that pods consume normally. With Vault injection, the secrets are fetched at pod startup time directly from Vault and never exist as Kubernetes secrets at all. When the Vault Agent Injector webhook is unavailable, pods with injection annotations will fail to start because the webhook cannot modify them to add the injection machinery.
-
-**Possible Impact**  
-The impact is immediate for new pod deployments that request Vault injection. Those pods will either fail to be created if the webhook failure policy is set to Fail, or they will be created without secret injection if the policy is set to Ignore. In the first case, your deployments are blocked. In the second case, your applications start but lack their required credentials, which typically causes them to crash or fail health checks immediately. Unlike External Secrets where existing pods continue running, Vault injection affects every pod deployment because the injection happens at pod creation time. This makes scaling operations particularly dangerous. If you need to scale up to handle load but the injector is down, your new pods will not get their credentials and will not contribute to serving traffic.
-
-**Potential Thresholds and Rationale**  
-Alert when the Vault Agent Injector has been unavailable for more than one minute. This is a shorter threshold than some other components because the injector is a webhook that participates in every pod creation, and failures here have immediate blast radius. One minute is enough to distinguish between a brief pod restart and a sustained outage, while being aggressive enough to catch problems before they cause incident escalation.
-
-**PromQL Query**
-```promql
-# Alert when Vault Agent Injector has no available replicas
-kube_deployment_status_replicas_available{deployment=~"vault-agent-injector.*",namespace=~"vault.*"} == 0
-```
-
-**Alert Definition**
-```yaml
-groups:
-  - name: user_managed_secrets
-    interval: 30s
-    rules:
-      - alert: VaultAgentInjectorUnavailable
-        expr: kube_deployment_status_replicas_available{deployment=~"vault-agent-injector.*",namespace=~"vault.*"} == 0
-        for: 1m
-        labels:
-          severity: critical
-          component: secrets
-          managed_by: user
-        annotations:
-          summary: "Vault Agent Injector webhook is unavailable"
-          description: "Vault secret injection into pods has failed. New pods requesting injection cannot start. Check webhook failurePolicy to determine if pods are blocked or starting without secrets."
-          runbook_url: "https://your-runbook-url/vault-injector-unavailable"
-          action_required: "Check injector pod status, verify webhook certificate validity, ensure Vault connectivity, review mutating webhook configuration, check for resource constraints"
-```
-
----
-
-### **Alert 5: Critical DaemonSet Not Running on All Nodes**
-
-**Description**  
-This alert triggers when critical DaemonSets like Fluentbit, CrowdStrike, or Qualys are not running on all schedulable nodes, creating gaps in logging or security coverage.
-
-**Rationale**  
-DaemonSets are Kubernetes' mechanism for ensuring that specific pods run on every node in your cluster. This is perfect for infrastructure concerns that need node-level coverage, such as log collection, security monitoring, and vulnerability scanning. Your Fluentbit DaemonSet collects logs from all containers on each node and forwards them to your centralized logging system. Your CrowdStrike and Qualys DaemonSets provide endpoint detection and response as well as vulnerability scanning on each node. When a DaemonSet is not running on all nodes, you have blind spots. Logs from those nodes are not being collected, security events are not being detected, and vulnerabilities are not being scanned. In a banking environment with regulatory requirements for comprehensive audit logging and security monitoring, these gaps can become compliance violations.
-
-**Possible Impact**  
-The impact depends on which DaemonSet is affected and which nodes are missing coverage. If Fluentbit is not running on a node, any security incident or application error on that node will not appear in your logs, making forensic investigation difficult or impossible. If CrowdStrike is not running, malicious activity on that node may go undetected until it propagates to other systems. If Qualys is not running, you may be operating with vulnerable software on that node without knowing it. The problem compounds over time because these are continuous monitoring systems. A node without Fluentbit for six hours means six hours of missing logs. A node without CrowdStrike for a day means a full day where an attacker could have established persistence without being detected.
-
-**Potential Thresholds and Rationale**  
-Alert when a critical DaemonSet has desired pods that exceed available pods by more than zero for five minutes. This means at least one node is missing the DaemonSet pod. The five-minute threshold accounts for normal situations like new nodes being added to the cluster where it takes a moment for the DaemonSet pod to be scheduled and become ready. You should customize this alert to target your specific critical DaemonSets rather than alerting on all DaemonSets, since some may be less critical or expected to run only on subsets of nodes using node selectors.
-
-**PromQL Query**
-```promql
-# Alert when critical DaemonSets are not running on all desired nodes
+# Monitors all critical DaemonSets for incomplete deployment
+# Alerts when any DaemonSet has nodes missing the required pod
 (
-  kube_daemonset_status_desired_number_scheduled{daemonset=~"fluentbit|crowdstrike|qualys-scanner"}
+  kube_daemonset_status_desired_number_scheduled{
+    daemonset=~"fluentbit.*|fluent-bit.*|crowdstrike.*|qualys.*|aqua-enforcer.*|antrea-agent.*|konnectivity-agent.*",
+    namespace!="kube-system"
+  }
   - 
-  kube_daemonset_status_number_ready{daemonset=~"fluentbit|crowdstrike|qualys-scanner"}
+  kube_daemonset_status_number_ready{
+    daemonset=~"fluentbit.*|fluent-bit.*|crowdstrike.*|qualys.*|aqua-enforcer.*|antrea-agent.*|konnectivity-agent.*",
+    namespace!="kube-system"
+  }
 ) > 0
 ```
 
+This query calculates the gap between desired pods and ready pods for each DaemonSet. The desired number tells you how many nodes should have this DaemonSet pod based on node selectors and tolerations. The ready number tells you how many are actually running and healthy. The difference reveals your coverage gap. I've included your security agents, logging collectors, and network components in the filter. Notice I'm again excluding kube-system because components like konnectivity-agent in that namespace are managed by GCP and belong in your informational alerts.
+
 **Alert Definition**
 ```yaml
 groups:
-  - name: user_managed_infrastructure
+  - name: critical_daemonsets
     interval: 30s
     rules:
-      - alert: CriticalDaemonSetNotFullyDeployed
+      - alert: CriticalDaemonSetIncomplete
         expr: |
           (
-            kube_daemonset_status_desired_number_scheduled{daemonset=~"fluentbit|crowdstrike|qualys-scanner"}
+            kube_daemonset_status_desired_number_scheduled{
+              daemonset=~"fluentbit.*|fluent-bit.*|crowdstrike.*|qualys.*|aqua-enforcer.*|antrea-agent.*",
+              namespace!="kube-system"
+            }
             - 
-            kube_daemonset_status_number_ready{daemonset=~"fluentbit|crowdstrike|qualys-scanner"}
+            kube_daemonset_status_number_ready{
+              daemonset=~"fluentbit.*|fluent-bit.*|crowdstrike.*|qualys.*|aqua-enforcer.*|antrea-agent.*",
+              namespace!="kube-system"
+            }
           ) > 0
         for: 5m
         labels:
           severity: warning
-          component: infrastructure
+          component: daemonset
           managed_by: user
         annotations:
-          summary: "DaemonSet {{ $labels.daemonset }} is not running on all nodes"
-          description: "{{ $value }} nodes are missing this critical DaemonSet pod. This creates gaps in {{ if eq $labels.daemonset \"fluentbit\" }}log collection{{ else if eq $labels.daemonset \"crowdstrike\" }}security monitoring{{ else }}vulnerability scanning{{ end }}."
+          summary: "DaemonSet {{ $labels.daemonset }} has incomplete node coverage"
+          description: |
+            DaemonSet {{ $labels.daemonset }} in namespace {{ $labels.namespace }} is missing {{ $value }} pods.
+            
+            Coverage gap impact:
+            - fluentbit/fluent-bit: Log collection gaps, missing audit trail
+            - crowdstrike: Security monitoring blind spot, potential compliance violation
+            - qualys: Vulnerability scanning incomplete, unscanned attack surface
+            - aqua-enforcer: Runtime security enforcement gaps
+            - antrea-agent: Network policy enforcement incomplete
+            
+            This typically indicates node scheduling issues, resource constraints, or taint/toleration mismatches.
           runbook_url: "https://your-runbook-url/daemonset-incomplete"
-          action_required: "Identify which nodes are missing pods, check for node taints or tolerations issues, verify resource availability on affected nodes, review DaemonSet pod logs for scheduling failures"
+          action_required: "kubectl get pods -n {{ $labels.namespace }} -l app={{ $labels.daemonset }} -o wide, kubectl get nodes --show-labels, check for node taints and resource pressure"
 ```
+
+I've set this at warning severity rather than critical because while coverage gaps are serious, they don't typically cause immediate widespread service disruption the way a controller failure does. You need to investigate and remediate, but it's not usually a middle-of-the-night emergency.
 
 ---
 
-## **Category 2: Important Actionable Alerts - Degradation and Performance**
+## **Consolidated Alert 3: Pod Scheduling and Stability Issues**
 
-These alerts indicate problems that require investigation and remediation but may not immediately impact production services. They typically give you early warning of issues that could escalate into critical failures if left unaddressed.
+Here's where we can make a significant consolidation that reduces noise while actually improving signal quality. Your original design had separate alerts for pods stuck pending and pods with high restart rates. These are both pod-level health issues, but they have different root causes and require different responses, so I recommend keeping them separate rather than consolidating them into a single alert. However, we can refine each one to reduce noise.
 
-### **Alert 6: Pod Stuck in Pending State**
+**Alert 3a: Pods Stuck in Pending State**
 
-**Description**  
-This alert fires when user-managed pods remain in Pending state for an extended period, indicating they cannot be scheduled onto nodes.
-
-**Rationale**  
-When a pod is Pending, it means the Kubernetes scheduler cannot find a suitable node to run it on. This happens for several reasons, and understanding the distinction is important for your troubleshooting. The pod might have resource requests that exceed available capacity on any node, meaning you need larger nodes or more nodes in your cluster. It might have node selectors or node affinity rules that match no nodes, indicating a configuration mismatch. It might require a persistent volume that cannot be provisioned or attached. Or it might have tolerations that do not match the taints on available nodes. Each root cause requires a different remediation approach, but they all manifest as the pod sitting in Pending state indefinitely.
-
-**Possible Impact**  
-Pods stuck Pending cannot serve traffic or perform their intended function. If this affects your ArgoCD repo server, then Git repository operations slow down or fail. If it affects Alertmanager, you may not receive notifications for other alerts. The impact extends beyond the specific pod because other components may depend on it. For instance, if your CINS Kubernetes Operator pod is Pending, then the custom resources it manages will not be reconciled, creating a cascading effect where seemingly unrelated applications fail to deploy or update.
-
-**Potential Thresholds and Rationale**  
-Alert when pods have been Pending for more than ten minutes. Normal pod startup typically completes in under a minute, even accounting for image pulls. Ten minutes is conservative enough to avoid alerting on transient scheduling delays during cluster scaling events, but aggressive enough to catch real problems before they cause visible service impact. You should exclude certain namespaces like kube-system from this alert since GCP-managed components in that namespace are outside your control.
+The key refinement here is adding more sophisticated filtering to exclude expected pending states and focus on genuine scheduling failures.
 
 **PromQL Query**
 ```promql
-# Alert when user pods are stuck Pending
-# Exclude kube-system since those are GCP-managed
-kube_pod_status_phase{phase="Pending",namespace!="kube-system"} == 1
+# Alert on pods stuck pending, excluding system namespaces and specific expected cases
+kube_pod_status_phase{
+  phase="Pending",
+  namespace!~"kube-system|kube-public|kube-node-lease"
+} == 1
 ```
+
+I've excluded not just kube-system but also kube-public and kube-node-lease, which are other GCP-managed namespaces. You might also want to add any namespaces where you deliberately run pending pods for testing or validation purposes.
 
 **Alert Definition**
 ```yaml
 groups:
-  - name: user_managed_workloads
+  - name: pod_health
     interval: 30s
     rules:
       - alert: PodStuckPending
-        expr: kube_pod_status_phase{phase="Pending",namespace!="kube-system"} == 1
+        expr: |
+          kube_pod_status_phase{
+            phase="Pending",
+            namespace!~"kube-system|kube-public|kube-node-lease"
+          } == 1
         for: 10m
         labels:
           severity: warning
@@ -261,42 +171,47 @@ groups:
           managed_by: user
         annotations:
           summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} stuck in Pending state"
-          description: "Pod cannot be scheduled. Common causes: insufficient resources, unsatisfied node selectors, volume provisioning failures, or taint/toleration mismatches."
+          description: |
+            Pod has been Pending for over 10 minutes and cannot be scheduled.
+            
+            Common root causes:
+            - Insufficient cluster resources (CPU, memory, or ephemeral storage)
+            - Unsatisfied node selectors or affinity rules
+            - Volume provisioning failure or PVC issues
+            - Taint/toleration mismatches preventing scheduling
+            - Pod security policies or admission webhook rejections
+            
+            Investigate with: kubectl describe pod -n {{ $labels.namespace }} {{ $labels.pod }}
           runbook_url: "https://your-runbook-url/pod-pending"
-          action_required: "Run 'kubectl describe pod' to see scheduling events, check cluster capacity with 'kubectl top nodes', verify PVC status if pod uses volumes, review pod resource requests and node selectors"
+          action_required: "Check pod events for scheduling failures, verify cluster capacity, review resource requests, check PVC status if applicable"
 ```
 
----
+**Alert 3b: Pods with High Restart Rates**
 
-### **Alert 7: High Pod Restart Rate for Critical Components**
-
-**Description**  
-This alert detects when critical user-managed pods are experiencing frequent restarts, indicating application instability or resource issues.
-
-**Rationale**  
-Healthy pods should run continuously without restarts. When you see frequent restarts, it indicates one of several underlying problems. The application might have a memory leak causing OOMKills where the process consumes more memory than its limit and the kernel kills it. The liveness probe might be misconfigured, failing even though the application is healthy, causing Kubernetes to restart the pod unnecessarily. The application might be crashing due to bugs, misconfigurations, or dependency failures. Or the pod might be experiencing resource contention where CPU throttling or disk I/O issues cause it to fail health checks. Each restart causes brief unavailability, and continuous restart loops can prevent the application from ever becoming stable enough to serve traffic.
-
-**Possible Impact**  
-The immediate impact is reduced availability as the pod cycles through crash loops. Each restart takes time for the container to initialize, for the application to start up, and for health checks to pass. If this affects your ArgoCD Redis instance, you might see intermittent failures in Git operations as the cache becomes unavailable. If it affects your Aqua Enforcer, you get temporary gaps in runtime security enforcement. The secondary impact is cluster resource waste as the scheduler repeatedly tries to restart the pod, consuming CPU cycles and potentially triggering autoscaling unnecessarily.
-
-**Potential Thresholds and Rationale**  
-Alert when a pod has restarted more than five times in thirty minutes. This threshold distinguishes between a single failure that was resolved by restart versus chronic instability. Five restarts in thirty minutes means the pod is stuck in a restart loop that will not self-resolve, requiring human intervention to diagnose and fix the underlying cause.
+For restart rate monitoring, the refinement is to focus on recent restarts rather than all-time restart counts, which gives you better signal about current instability versus historical issues.
 
 **PromQL Query**
 ```promql
-# Alert on high restart rate for user-managed pods
-# Excludes kube-system namespace
-rate(kube_pod_container_status_restarts_total{namespace!="kube-system"}[30m]) * 1800 > 5
+# Alert on pods restarting frequently in the last 30 minutes
+# Excludes system namespaces and calculates restart rate
+rate(kube_pod_container_status_restarts_total{
+  namespace!~"kube-system|kube-public|kube-node-lease"
+}[30m]) * 1800 > 5
 ```
+
+This calculates the restart rate over a thirty-minute window and multiplies by eighteen hundred (thirty minutes in seconds) to get the number of restarts in that window. When this exceeds five, you know the pod is in a restart loop that won't self-resolve.
 
 **Alert Definition**
 ```yaml
 groups:
-  - name: user_managed_workloads
+  - name: pod_health
     interval: 60s
     rules:
-      - alert: PodHighRestartRate
-        expr: rate(kube_pod_container_status_restarts_total{namespace!="kube-system"}[30m]) * 1800 > 5
+      - alert: PodFrequentRestarts
+        expr: |
+          rate(kube_pod_container_status_restarts_total{
+            namespace!~"kube-system|kube-public|kube-node-lease"
+          }[30m]) * 1800 > 5
         for: 5m
         labels:
           severity: warning
@@ -304,79 +219,111 @@ groups:
           managed_by: user
         annotations:
           summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} restarting frequently"
-          description: "Pod has restarted {{ $value | humanize }} times in last 30 minutes. Likely causes: OOMKills, application crashes, or failing health checks."
+          description: |
+            Container {{ $labels.container }} has restarted {{ $value | humanize }} times in the last 30 minutes.
+            
+            Common root causes:
+            - OOMKills from memory limit exceeded
+            - Application crashes or panic conditions
+            - Misconfigured liveness probes causing false failures
+            - Dependency failures (database, external API, etc.)
+            - Configuration errors in environment variables or mounted configs
+            
+            Check container status: kubectl get pod -n {{ $labels.namespace }} {{ $labels.pod }} -o jsonpath='{.status.containerStatuses[?(@.name=="{{ $labels.container }}")].lastState}'
           runbook_url: "https://your-runbook-url/pod-restarts"
-          action_required: "Check pod logs, review resource usage with 'kubectl top pod', examine liveness/readiness probe configuration, look for OOMKilled events in 'kubectl describe pod'"
+          action_required: "Review pod logs, check for OOMKilled in describe output, examine resource limits, validate liveness probe configuration"
 ```
 
 ---
 
-### **Alert 8: ArgoCD Application Health Degraded**
+## **Consolidated Alert 4: ArgoCD Platform Health**
 
-**Description**  
-This alert triggers when ArgoCD applications report degraded health status, indicating issues with the deployed resources even if they are in sync with Git.
+This is an interesting consolidation opportunity. Your original design had separate alerts for ArgoCD controller unavailability and application health degradation. These are related but serve different purposes, so let me show you how to handle this thoughtfully.
 
-**Rationale**  
-ArgoCD tracks two separate dimensions of application state. Sync status tells you whether the cluster state matches your Git repository. Health status tells you whether the deployed resources are actually functioning correctly. An application can be fully synced but unhealthy if the resources are deployed correctly but experiencing runtime failures. For example, your deployment might match Git perfectly, but the pods could be in CrashLoopBackOff due to a configuration error in a ConfigMap. ArgoCD determines health by examining the status fields of various Kubernetes resources. Deployments are healthy when all replicas are ready. Services are healthy when they have endpoints. Ingresses are healthy when their backends are available. When ArgoCD reports degraded health, it means these runtime checks are failing.
-
-**Possible Impact**  
-Degraded health indicates that while your GitOps process completed successfully, the deployed application is not functioning correctly. This could mean users are experiencing errors, background jobs are not processing, or data synchronization is failing. The degraded state might be temporary as pods roll out and become ready, or it might be persistent if there is a fundamental problem with the application configuration. The key risk is that you might believe a deployment succeeded based on ArgoCD showing it as synced, when in reality the application is broken.
-
-**Potential Thresholds and Rationale**  
-Alert when applications have been in degraded health status for more than ten minutes. This allows time for normal deployment processes where pods temporarily show as unhealthy during rolling updates. Ten minutes is long enough to distinguish between transient unhealthy states during deployments and persistent problems requiring investigation.
+The controller unavailability alert is actually already covered by your consolidated controller alert, so you don't need a separate one. However, ArgoCD application health is conceptually different because it's monitoring the state of your deployed applications rather than the ArgoCD platform itself. I recommend keeping this as a separate focused alert.
 
 **PromQL Query**
 ```promql
-# Alert when ArgoCD applications are unhealthy
-# Note: You may need to adjust this based on how ArgoCD exposes health metrics
-argocd_app_info{health_status=~"Degraded|Missing"} == 1
+# Alert when ArgoCD applications are not healthy
+# Combines both sync and health status issues
+argocd_app_info{
+  sync_status!="Synced"
+} == 1
+or
+argocd_app_info{
+  health_status!~"Healthy|Progressing"
+} == 1
 ```
+
+This query catches both synchronization failures and health issues in a single alert. The "or" operator means the alert fires if either condition is true. The health_status check excludes both Healthy and Progressing because Progressing is a normal transient state during deployments. We only care about Degraded, Missing, Unknown, or Suspended states.
 
 **Alert Definition**
 ```yaml
 groups:
-  - name: user_managed_gitops
+  - name: gitops_platform
     interval: 60s
     rules:
-      - alert: ArgoCDApplicationUnhealthy
-        expr: argocd_app_info{health_status=~"Degraded|Missing"} == 1
-        for: 10m
+      - alert: ArgoCDApplicationIssue
+        expr: |
+          argocd_app_info{sync_status!="Synced"} == 1
+          or
+          argocd_app_info{health_status!~"Healthy|Progressing"} == 1
+        for: 15m
         labels:
           severity: warning
           component: gitops
           managed_by: user
         annotations:
-          summary: "ArgoCD application {{ $labels.name }} is unhealthy"
-          description: "Application health status is {{ $labels.health_status }}. Resources are deployed but not functioning correctly. Check pod status and application logs."
-          runbook_url: "https://your-runbook-url/argocd-unhealthy"
-          action_required: "Review application in ArgoCD UI, check resource events and pod logs, verify ConfigMaps and Secrets are correct, examine resource limits and health check configuration"
+          summary: "ArgoCD application {{ $labels.name }} has issues"
+          description: |
+            Application {{ $labels.name }} in project {{ $labels.project }} is experiencing problems.
+            
+            Status: Sync={{ $labels.sync_status }}, Health={{ $labels.health_status }}
+            
+            Sync status issues indicate:
+            - OutOfSync: Cluster state differs from Git, manual changes or sync failures
+            - Unknown: ArgoCD cannot determine sync state
+            
+            Health status issues indicate:
+            - Degraded: Resources deployed but not functioning (pods crashing, failing health checks)
+            - Missing: Expected resources not found in cluster
+            - Unknown: Cannot determine health status
+            
+            Review in ArgoCD UI for detailed resource status and sync differences.
+          runbook_url: "https://your-runbook-url/argocd-application-issues"
+          action_required: "Check ArgoCD UI for detailed status, review application logs, verify Git repository accessibility, check for resource quota issues"
 ```
+
+The fifteen-minute threshold is important here. ArgoCD applications often show temporary out-of-sync or unhealthy states during deployments, and you don't want to alert on every rolling update. Fifteen minutes is long enough to let normal deployment processes complete while catching genuine problems that need investigation.
 
 ---
 
-## **Category 3: Informational Alerts - GCP-Managed Components**
+## **Informational Alerts: GCP-Managed Infrastructure**
 
-These alerts monitor GCP-managed infrastructure components. When they fire, you cannot directly fix the underlying issue, but you need to know about it for incident correlation and to inform your interactions with Google Cloud support. Set these at warning or informational severity rather than critical.
+These remain largely as they were because they're already monitoring at the right level of granularity. However, let me show you one consolidation opportunity.
 
-### **Alert 9: Node NotReady Status**
-
-**Description**  
-This alert fires when GKE nodes enter NotReady state, indicating Google's node management systems have detected a problem.
-
-**Rationale**  
-Even though GKE manages node health and will automatically repair or replace unhealthy nodes through node auto-repair, you need visibility into when this is happening. Node failures can cause temporary service disruptions as pods are rescheduled, and understanding the node failure pattern helps you make informed decisions about your cluster configuration. If you see frequent node failures in a particular node pool, it might indicate that your workload characteristics do not match the node type, or that you have reached capacity limits causing excessive pressure on nodes.
-
-**Possible Impact**  
-When a node goes NotReady, running pods on that node are eventually evicted and rescheduled to other nodes. For stateless workloads with multiple replicas, this might be transparent to users. For stateful workloads or single-replica services, you will see downtime during the migration. The auto-repair process takes several minutes to complete, during which your cluster has reduced capacity.
-
-**What You Can Action**  
-While you cannot fix the node itself, you can verify that auto-repair is functioning, check whether the node failure is affecting critical workloads, and potentially cordon other nodes if you see a pattern suggesting wider infrastructure issues. You can also adjust your pod disruption budgets or replica counts if node failures are causing too much impact.
+**Consolidated Alert 5: GCP-Managed Component Issues**
 
 **PromQL Query**
 ```promql
-# Alert on nodes in NotReady state
-kube_node_status_condition{condition="Ready",status="true"} == 0
+# Single alert for GCP-managed component degradation
+# Covers both node health and critical system component availability
+(
+  kube_node_status_condition{condition="Ready",status="true"} == 0
+)
+or
+(
+  kube_deployment_status_replicas_available{
+    deployment=~"kube-dns|metrics-server|event-exporter",
+    namespace="kube-system"
+  } < kube_deployment_spec_replicas{
+    deployment=~"kube-dns|metrics-server|event-exporter",
+    namespace="kube-system"
+  }
+)
 ```
+
+This combines node health with critical system component availability in kube-system. The second part of the query checks if available replicas are less than desired replicas, which catches partial degradation as well as complete failures.
 
 **Alert Definition**
 ```yaml
@@ -384,58 +331,36 @@ groups:
   - name: gcp_managed_infrastructure
     interval: 30s
     rules:
-      - alert: GKENodeNotReady
-        expr: kube_node_status_condition{condition="Ready",status="true"} == 0
-        for: 2m
-        labels:
-          severity: warning
-          component: node
-          managed_by: gcp
-        annotations:
-          summary: "Node {{ $labels.node }} is NotReady"
-          description: "Node has been NotReady for >2 minutes. GKE auto-repair should replace it automatically. Monitor for pod evictions and workload impact."
-          runbook_url: "https://your-runbook-url/node-not-ready"
-          action_required: "Monitor auto-repair progress in GCP Console, check which pods were running on the node, verify workloads rescheduled successfully, consider scaling node pool if pattern emerges"
-```
-
----
-
-### **Alert 10: CoreDNS Low Replica Count**
-
-**Description**  
-This alert triggers when the number of available CoreDNS replicas drops below the expected count, potentially affecting cluster DNS resolution.
-
-**Rationale**  
-GCP manages CoreDNS for you, but you still need to know when it is degraded. DNS is so fundamental to cluster operations that even partial degradation can cause mysterious failures. Applications might experience intermittent connection timeouts, service discovery might fail sporadically, and troubleshooting becomes difficult because the symptoms appear in many different places while the root cause is centralized in DNS.
-
-**Possible Impact**  
-With reduced CoreDNS capacity, you might see increased DNS query latency or timeout errors during high load periods. New pod startup times might increase as they wait for DNS resolution during initialization. In extreme cases where all CoreDNS pods are unavailable, all service-to-service communication that relies on DNS names will fail, effectively halting all application traffic.
-
-**What You Can Action**  
-You can check if network policies you created are blocking CoreDNS, verify that your cluster has sufficient resources for the kube-system namespace, and review whether recent changes to your cluster might have affected it. You can also open a support case with Google Cloud if the issue persists beyond what auto-repair should handle.
-
-**PromQL Query**
-```promql
-# Alert when CoreDNS availability is reduced
-kube_deployment_status_replicas_available{deployment="kube-dns",namespace="kube-system"} < 2
-```
-
-**Alert Definition**
-```yaml
-groups:
-  - name: gcp_managed_infrastructure
-    interval: 30s
-    rules:
-      - alert: GKECoreDNSLowReplicas
-        expr: kube_deployment_status_replicas_available{deployment="kube-dns",namespace="kube-system"} < 2
+      - alert: GCPManagedComponentDegraded
+        expr: |
+          (
+            kube_node_status_condition{condition="Ready",status="true"} == 0
+          )
+          or
+          (
+            kube_deployment_status_replicas_available{
+              deployment=~"kube-dns|metrics-server|event-exporter",
+              namespace="kube-system"
+            } < kube_deployment_spec_replicas{
+              deployment=~"kube-dns|metrics-server|event-exporter",
+              namespace="kube-system"
+            }
+          )
         for: 3m
         labels:
-          severity: warning
-          component: dns
+          severity: info
+          component: gcp_managed
           managed_by: gcp
         annotations:
-          summary: "CoreDNS has fewer than 2 replicas available"
-          description: "CoreDNS replica count is {{ $value }}, expected 2+. DNS resolution may be degraded. This is GCP-managed; monitor for auto-recovery."
-          runbook_url: "https://your-runbook-url/coredns-low-replicas"
-          action_required: "Monitor DNS query latency, check for recent cluster changes that might affect kube-system namespace, verify no user-created network policies block CoreDNS, escalate to Google Cloud support if persistent"
+          summary: "GCP-managed component {{ $labels.node }}{{ $labels.deployment }} is degraded"
+          description: |
+            A GCP-managed infrastructure component is experiencing issues.
+            
+            If this is a node: Node {{ $labels.node }} is NotReady. GKE auto-repair should handle this automatically.
+            If this is a deployment: {{ $labels.deployment }} in kube-system has {{ $value }} replicas when expecting more.
+            
+            These components are managed by Google Cloud Platform. Monitor for auto-recovery.
+            If issues persist beyond 15 minutes, escalate to GCP support.
+          runbook_url: "https://your-runbook-url/gcp-component-degraded"
+          action_required: "Monitor in GCP Console, check for ongoing maintenance or incidents in GCP Status Dashboard, verify no user changes affecting system namespace, escalate to GCP support if persistent"
 ```
